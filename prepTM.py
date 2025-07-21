@@ -1,121 +1,111 @@
+import os
 import re
 import io
 from datetime import date
 from email import policy
 from email.parser import BytesParser
 from typing import List, Dict, Any
-import pandas as pd
+import csv
+
+try:
+    import extract_msg
+except ImportError:
+    extract_msg = None
 
 __all__ = [
     "extract_som_entries",
-    "parse_eml",
-    "extract_csv_from_eml",
-    "extract_urls_from_eml",
-    "clean_values",
-    "format_som_entries",
 ]
 
-# Hard‑coded template TYPES for Trend Micro Suspicious Object Management
-TEMPLATE_TYPES = [
+# Hard‑coded template TYPES for Trend Micro SOM
+TEMPLATE_TYPES: List[str] = [
     "domain",
     "url",
-    "ip",        # IPv4 / IPv6 entries handled by order
-    "ip",
+    "ip",  # IPv4
+    "ip",  # IPv6
     "sha1",
     "sha256",
     "email_sender",
 ]
 
 
-def parse_eml(eml_path: str) -> Any:
-    """
-    Parse an .eml file and return the email.message.Message object.
-    """
-    with open(eml_path, 'rb') as f:
-        msg = BytesParser(policy=policy.default).parse(f)
-    return msg
+def parse_message(path: str) -> Any:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".eml":
+        with open(path, 'rb') as f:
+            return BytesParser(policy=policy.default).parse(f)
+    elif ext == ".msg":
+        if extract_msg is None:
+            raise RuntimeError("extract_msg library not installed; cannot parse .msg files")
+        msg = extract_msg.Message(path)
+        msg.convert()
+        return msg
+    else:
+        raise ValueError(f"Unsupported file type: {ext}")
 
 
-def extract_csv_from_eml(msg: Any) -> pd.DataFrame:
-    """
-    Find the first .csv attachment in the email and return it as a DataFrame.
-    """
-    for part in msg.walk():
-        filename = part.get_filename() or ""
-        if part.get_content_disposition() == 'attachment' and filename.lower().endswith('.csv'):
-            raw = part.get_payload(decode=True).decode('utf-8', errors='replace')
-            return pd.read_csv(io.StringIO(raw))
-    return pd.DataFrame()
+def extract_csv_from_message(msg) -> List[Dict[str, str]]:
+    # returns list of dict rows
+    # .eml
+    if hasattr(msg, 'walk'):
+        for part in msg.walk():
+            fn = part.get_filename() or ""
+            if part.get_content_disposition() == 'attachment' and fn.lower().endswith('.csv'):
+                raw = part.get_payload(decode=True).decode('utf-8', errors='replace')
+                reader = csv.DictReader(io.StringIO(raw))
+                return [row for row in reader]
+    # .msg
+    if extract_msg and isinstance(msg, extract_msg.Message):
+        for att in msg.attachments:
+            fn = att.longFilename or att.shortFilename or ""
+            if fn.lower().endswith('.csv'):
+                data = att.data.decode('utf-8', errors='replace')
+                reader = csv.DictReader(io.StringIO(data))
+                return [row for row in reader]
+    return []
 
 
-def extract_urls_from_eml(msg: Any) -> List[str]:
-    """
-    Extract all URLs from the HTML body of an email, fixing `hxxp` -> `http`.
-    """
-    html_part = msg.get_body(preferencelist=('html',))
-    html = html_part.get_content() if html_part else ""
+def extract_urls_from_message(msg) -> List[str]:
+    if hasattr(msg, 'get_body'):
+        html_part = msg.get_body(preferencelist=('html',))
+        html = html_part.get_content() if html_part else ""
+    elif extract_msg and isinstance(msg, extract_msg.Message):
+        html = msg.htmlBody or ""
+    else:
+        html = ""
     urls = re.findall(r'h(?:xx)?tp[s]?://[^\s"<>]+', html)
-    return [re.sub(r'hxxp', 'http', u) for u in urls]
+    return [u.replace('hxxp', 'http') for u in urls]
 
 
-def clean_values(values: List[Any]) -> List[str]:
-    """
-    Convert each value to string, remove brackets, and strip whitespace.
-    """
-    cleaned = []
-    for v in values:
-        s = str(v).replace('[', '').replace(']', '').strip()
-        cleaned.append(s)
-    return cleaned
+def clean_values(vals: List[str]) -> List[str]:
+    return [v.replace('[', '').replace(']', '').strip() for v in vals]
 
 
-def format_som_entries(
-    csv_df: pd.DataFrame,
-    urls: List[str],
-    description_prefix: str = None
-) -> pd.DataFrame:
-    """
-    Build a DataFrame of Trend Micro SOM entries with columns:
-      - Type
-      - Object
-      - Description (cert+YYYY-MM-DD by default)
-
-    One row per value in TEMPLATE_TYPES; multiple values produce multiple rows.
-    """
-    # Determine description
-    if description_prefix is None:
-        today = date.today().isoformat()
-        description_prefix = f"cert+{today}"
-
-    # Gather raw extracted values
+def format_som_entries(rows: List[Dict[str, str]], urls: List[str], desc_prefix: str = None) -> List[Dict[str, str]]:
+    if desc_prefix is None:
+        desc_prefix = f"cert {date.today().isoformat()}"
+    # collect by type
     extracted: Dict[str, List[str]] = {
-        'domain':       clean_values(csv_df['domain'].dropna().tolist()) if 'domain' in csv_df.columns else [],
-        'url':          clean_values(urls),
-        'ip':           clean_values(csv_df['IP'].dropna().tolist()) if 'IP' in csv_df.columns else [],
-        'sha1':         clean_values(csv_df['sha1'].dropna().tolist()) if 'sha1' in csv_df.columns else [],
-        'sha256':       clean_values(csv_df['sha256'].dropna().tolist()) if 'sha256' in csv_df.columns else [],
-        'email_sender': clean_values(csv_df['email_sender'].dropna().tolist()) if 'email_sender' in csv_df.columns else [],
+        "domain": clean_values([r["domain"] for r in rows if r.get("domain")]),
+        "ip": clean_values([r["IP"] for r in rows if r.get("IP")]),
+        "sha1": clean_values([r["sha1"] for r in rows if r.get("sha1")]),
+        "sha256": clean_values([r["sha256"] for r in rows if r.get("sha256")]),
+        "email_sender": clean_values([r["email_sender"] for r in rows if r.get("email_sender")]),
+        "url": clean_values(urls),
     }
-
-    # Build SOM entries, maintaining order in TEMPLATE_TYPES
-    rows = []
+    # build output list of dicts
+    output = []
     for t in TEMPLATE_TYPES:
-        for value in extracted.get(t, []):
-            rows.append({
-                'Type': t,
-                'Object': value,
-                'Description': description_prefix
+        for val in extracted.get(t, []):
+            output.append({
+                "Type": t,
+                "Object": val,
+                "Description": desc_prefix
             })
+    return output
 
-    return pd.DataFrame(rows)
 
-
-def extract_som_entries(eml_path: str, description_prefix: str = None) -> pd.DataFrame:
-    """
-    High-level function: given path to .eml, parse and return formatted
-    DataFrame ready for Trend Micro Suspicious Object Management import.
-    """
-    msg = parse_eml(eml_path)
-    csv_df = extract_csv_from_eml(msg)
-    urls = extract_urls_from_eml(msg)
-    return format_som_entries(csv_df, urls, description_prefix)
+def extract_som_entries(path: str, desc_prefix: str = None) -> List[Dict[str, str]]:
+    msg = parse_message(path)
+    csv_rows = extract_csv_from_message(msg)
+    urls = extract_urls_from_message(msg)
+    return format_som_entries(csv_rows, urls, desc_prefix)
